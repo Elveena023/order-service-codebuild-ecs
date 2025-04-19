@@ -1,0 +1,129 @@
+name: Build on Pull & Push on Merge to main
+
+on:
+  pull_request:
+    branches:
+      - '*'
+
+  push:
+    branches:
+      - "main"
+
+jobs:
+  build_only:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN_ACTIONS }}
+      AWS_ROLE_ARN: arn:aws:iam::189849168476:role/gha-checkout-earthlink
+      AWS_REGION: us-east-1
+      DOCKER_REPO_URL: 189849168476.dkr.ecr.us-east-1.amazonaws.com
+      DOCKER_IMAGE_NAME: checkout-earthlink
+      SONAR_PROJECT_KEY: acu-checkout-earthlink
+      SONAR_HOST_URL: https://sonarqube.ac-utility.redventures.io
+      AWS_ROLE_SESSION_NAME: gha-checkout-earthlink
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Setup JDK 8
+        uses: actions/setup-java@v1
+        with:
+          java-version: 8
+  
+      - name: Assumes AWS role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: ${{ env.AWS_ROLE_SESSION_NAME }}
+
+      - name: Set CODEARTIFACT_AUTH_TOKEN
+        run: |
+          CODEARTIFACT_AUTH_TOKEN=$(aws codeartifact get-authorization-token --domain ac-utility --domain-owner 189849168476 --query authorizationToken --output text)
+          echo "CODEARTIFACT_AUTH_TOKEN=$CODEARTIFACT_AUTH_TOKEN" >> $GITHUB_ENV
+          echo "::add-mask::$CODEARTIFACT_AUTH_TOKEN"
+      - name: Run Maven to extract project version
+        id: extract-version
+        run: |
+          echo current_version=$(mvn -s .github/workflows/settings.xml help:evaluate -Dexpression=project.version -q -DforceStdout) >> $GITHUB_ENV
+          echo "::set-output name=current_version::$current_version"
+      - name: Get latest version from ECR
+        id: get_latest_version
+        run: |
+          echo "latest_version=$(aws ecr describe-images --repository-name checkout-earthlink | jq -r '.imageDetails | map(select(.imageTags[] | startswith("v"))) | map(.imageTags[] | select(startswith("v"))) | max | ltrimstr("v")')" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Print Latest Version
+        run: echo "Latest version is $latest_version"
+
+      - name: Check version
+        run: |
+          echo "latest_version: $latest_version"
+          echo "current_version: $current_version"
+          if [[ "$current_version" == "$latest_version" ]]; then
+            echo "Error: current_version $current_version already exists in ECR. Change the version in pom.xml."
+            exit 1
+          else
+            echo "current_version $current_version is different. Proceeding with Docker build and push."
+          fi
+      - name: Build
+        run: mvn -s .github/workflows/settings.xml dependency:purge-local-repository -DmanualIncludes=com.allconnect:AllConnectParent,com.allconnect.checkout:checkout-core-jar
+
+      - name: Build
+        run: mvn clean install -s .github/workflows/settings.xml
+
+      - name: Persist to Workspace
+        uses: actions/upload-artifact@v2
+        with:
+          name: checkout-earthlink
+          path: ./
+
+      - name: SonarQube Analysis
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          mvn -s .github/workflows/settings.xml org.sonarsource.scanner.maven:sonar-maven-plugin:3.9.1.2184:sonar -Dmaven.test.skip=true -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }} -Dsonar.host.url=${{ env.SONAR_HOST_URL }} -Dsonar.login=$SONAR_TOKEN
+      
+
+      - name: Docker login
+        run: |
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.DOCKER_REPO_URL }}
+      - name: Build image
+        id: build-image
+        run: |
+          current_version=$current_version
+          docker build -f .github/workflows/Dockerfile -t ${{ env.DOCKER_IMAGE_NAME }}:$current_version --build-arg WAR_FILE=/target/checkout-earthlink.war .
+          docker tag ${{ env.DOCKER_IMAGE_NAME }}:$current_version ${{ env.DOCKER_REPO_URL }}/${{ env.DOCKER_IMAGE_NAME }}:$current_version
+          docker tag ${{ env.DOCKER_IMAGE_NAME }}:$current_version ${{ env.DOCKER_REPO_URL }}/${{ env.DOCKER_IMAGE_NAME }}:v$current_version
+          docker tag ${{ env.DOCKER_REPO_URL }}/${{ env.DOCKER_IMAGE_NAME }}:$current_version ${{ env.DOCKER_REPO_URL }}/${{ env.DOCKER_IMAGE_NAME }}:latest
+        shell: bash
+
+      - name: Deploy
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          mvn -s .github/workflows/settings.xml deploy -Dmaven.test.skip=true -DaltDeploymentRepository=ac-utility-maven::default::https://ac-utility-189849168476.d.codeartifact.us-east-1.amazonaws.com/maven/maven/
+      - name: Push image
+        id: push-image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker images --format "{{.Repository}}:{{.Tag}}" > docker_image_names.txt
+          docker push ${{ env.DOCKER_REPO_URL }}/${{ env.DOCKER_IMAGE_NAME }}:latest
+          docker push ${{ env.DOCKER_REPO_URL }}/${{ env.DOCKER_IMAGE_NAME }}:v$current_version
+        shell: bash
+
+      - name: Create a GitHub Release
+        id: create_release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ env.current_version }}
+          release_name: v${{ env.current_version }}
+          body: v${{ env.current_version }}
+          draft: false
+          prerelease: false
